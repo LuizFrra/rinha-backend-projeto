@@ -2,11 +2,11 @@ package luiz.rinha.backend;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zaxxer.hikari.HikariDataSource;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpStatus;
-import org.postgresql.ds.PGConnectionPoolDataSource;
-import org.postgresql.ds.PGPooledConnection;
+import org.eclipse.jetty.util.thread.ExecutorThreadPool;
 
 import java.sql.*;
 import java.time.Instant;
@@ -23,52 +23,16 @@ import java.util.Map;
 public class Main {
 
     static ObjectMapper objectMapper = new ObjectMapper();
-    static Connection conn = null;
 
-    static PGPooledConnection pooledConnection = null;
+    static HikariDataSource ds = null;
 
-    static void createClientTable() {
-        String createTableTransaction = """
-                    CREATE TABLE transacoes (
-                        transacao_id SERIAL PRIMARY KEY,
-                        transacao_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        limite INT,
-                        valor INT,
-                        valor_apos_transacao INT,
-                        transacao_type VARCHAR(1),
-                        descricao VARCHAR(10),
-                        client_id INT
-                    );
-                    CREATE INDEX idx_client_id ON transacoes (client_id DESC);
-                """;
+    public static void main(String[] args) {
+        ds = new HikariDataSource();
+        String dbConnectionString = "jdbc:postgresql://db:5432/rinha?user=rinha&password=rinha";
+        ds.setJdbcUrl(dbConnectionString);
 
-        String initialValues = """
-                       INSERT INTO transacoes (limite, valor, valor_apos_transacao, client_id, transacao_type) VALUES
-                       (100000, 0, 0, 1, 's'),
-                       (80000, 0, 0, 2, 's'),
-                       (1000000, 0, 0, 3, 's'),
-                       (10000000, 0, 0, 4, 's'),
-                       (500000, 0, 0, 5, 's');
-                """;
-        try (Connection connection = pooledConnection.getConnection()) {
-            Statement st = connection.createStatement();
-            st.execute(createTableTransaction);
-            st.execute(initialValues);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    public static void main(String[] args) throws SQLException, InterruptedException {
-        Thread.sleep(5000);
-        String dbConnectionString = "jdbc:postgresql://db:5432/rinha?user=rinha&password=rinha&maxConnections=10";
-        conn = DriverManager.getConnection(dbConnectionString);
-        pooledConnection = new PGPooledConnection(
-                conn, true
-        );
-        createClientTable();
         Javalin app = Javalin.create(config -> {
-                    config.useVirtualThreads = true;
+            config.useVirtualThreads = true;
                 }).post("/clientes/{id}/transacoes", Main::postTransaction)
                 .get("/clientes/{id}/extrato", Main::getExtract)
                 .start(8080);
@@ -84,29 +48,32 @@ public class Main {
             return;
         }
 
-        try (Connection conn = pooledConnection.getConnection()) {
+        try (Connection conn = ds.getConnection()) {
             Statement st = conn.createStatement();
             ResultSet rs = st.executeQuery(String.format("""
-                            SELECT transacao_time, valor, transacao_type, descricao, limite
+                            SELECT transacao_time, valor, transacao_type, descricao, limite, valor_apos_transacao
                             FROM public.transacoes
                             WHERE client_id = %d
                             ORDER BY transacao_id DESC
+                            LIMIT 11
                             """, clientId));
 
             Map<String, Object> extrato = new HashMap<>();
-            int total = 0;
+            Integer total = null;
             int limite = 0;
             List<Map<String, Object>> transacoes = new ArrayList<>();
-            while (rs.next()) {
+            while (rs.next() && transacoes.size() <= 10) {
                 String tipo = rs.getString("transacao_type");
                 if (!"s".equals(tipo)) {
+                    if (total == null) {
+                        total = rs.getInt("valor_apos_transacao");
+                    }
                     int valorTransacao = rs.getInt("valor");
                     Map<String, Object> transacao = new HashMap<>();
                     transacao.put("realizado_em", rs.getTimestamp("transacao_time").toString()+"Z");
                     transacao.put("valor", valorTransacao);
-                    transacao.put("tipo, ", rs.getString("transacao_type"));
+                    transacao.put("tipo", rs.getString("transacao_type"));
                     transacao.put("descricao", rs.getString("descricao"));
-                    total += valorTransacao;
                     transacoes.add(transacao);
                 }
                 limite = rs.getInt("limite");
@@ -117,31 +84,22 @@ public class Main {
                 return;
             }
 
+            if (total == null) {
+                total = 0;
+            }
+
             Map<String, Object> saldo = new HashMap<>();
             saldo.put("limite", limite);
-            saldo.put("saldo", total);
+            saldo.put("total", total);
             saldo.put("data_extrato", currentDate(0));
 
-            extrato.put("transacoes", transacoes);
+            extrato.put("ultimas_transacoes", transacoes);
             extrato.put("saldo", saldo);
 
             ctx.result(objectMapper.writeValueAsString(extrato));
-        } catch (SQLException e) {
+        } catch (SQLException | JsonProcessingException e) {
             ctx.status(HttpStatus.INTERNAL_SERVER_ERROR);
-            e.printStackTrace();
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException(e);
         }
-    }
-
-    public static String currentDate(int timestamp) {
-        ZonedDateTime zonedDateTime = ZonedDateTime.now();
-        if (timestamp > 0) {
-            Instant instant = Instant.ofEpochSecond(timestamp);
-            zonedDateTime = ZonedDateTime.ofInstant(instant, ZoneId.systemDefault());
-        }
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'");
-        return zonedDateTime.format(formatter);
     }
 
     public static void postTransaction(Context ctx) {
@@ -156,13 +114,19 @@ public class Main {
         try {
             clientId = Integer.valueOf(clientIdAsStr);
             bodyAsMap = objectMapper.readValue(ctx.bodyAsBytes(), HashMap.class);
+            Object valueUntype = bodyAsMap.get("valor");
+            if (!(valueUntype instanceof Integer)) {
+                ctx.status(HttpStatus.UNPROCESSABLE_CONTENT);
+                return;
+            }
             value = (Integer) bodyAsMap.get("valor");
             type = (String) bodyAsMap.get("tipo");
             description = (String) bodyAsMap.get("descricao");
             if (value == null || type == null || description == null ||
                     type.isBlank() || description.isBlank() || description.length() > 10
+                    || !(type.equals("c") || type.equals("d"))
             ) {
-                ctx.status(HttpStatus.BAD_REQUEST);
+                ctx.status(HttpStatus.UNPROCESSABLE_CONTENT);
                 return;
             }
         } catch (Exception ignored) {
@@ -172,7 +136,11 @@ public class Main {
 
         // UPDATE HERE
         try {
-            Map result = doTransaction(clientId, value, type, description);
+            Map<String, Object> result = doTransactionWithFunction(clientId, value, type, description);
+            if (result == null) {
+                ctx.status(HttpStatus.NOT_FOUND);
+                return;
+            }
             String resultAsStr = objectMapper.writeValueAsString(result);
             if (resultAsStr.contains("unprocess")) {
                 ctx.status(HttpStatus.UNPROCESSABLE_CONTENT);
@@ -180,64 +148,46 @@ public class Main {
             }
             ctx.result(resultAsStr);
         } catch (Exception e) {
-            e.printStackTrace();
             ctx.status(HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
 
-    static Map<String, Object> doTransaction(Integer clientId, Integer value, String type, String description) {
-        try (Connection conn = pooledConnection.getConnection()) {
-            conn.setAutoCommit(false);
-            value = Math.abs(value);
-            Statement st = conn.createStatement();
-            ResultSet rs = st.executeQuery(
-                    String.format("""
-                                   SELECT limite, valor_apos_transacao
-                                           FROM transacoes
-                                           WHERE client_id = %d
-                                           ORDER BY transacao_id DESC
-                                           LIMIT 1
-                                           FOR UPDATE
-                            """, clientId)
+    static Map<String, Object> doTransactionWithFunction(Integer clientId, Integer value, String type, String description) {
+        try (Connection conn = ds.getConnection()) {
+            String functionCall = String.format(
+                    "SELECT * FROM process_transaction(%d, %d, '%s', '%s')", clientId, value, type, description
             );
-
+            Statement st = conn.createStatement();
+            ResultSet rs = st.executeQuery(functionCall);
             if (rs.next()) {
-                int limit = rs.getInt("limite");
-                int currentValue = rs.getInt("valor_apos_transacao");
-                int newValue = Integer.MAX_VALUE;
-
-                if ("c".equals(type)) {
-                    newValue = currentValue + value;
-                } else if ("d".equals(type)) {
-                    newValue = currentValue - value;
-                    value *= -1;
-                }
-
-                if ("d".equals(type)) {
-                    if (newValue < 0 && (newValue < (limit * -1))) {
-                        Map<String, Object> result = new HashMap<>();
-                        result.put("unprocess", 422);
-                        conn.commit();
-                        return result;
-                    }
-                }
-
-                st = conn.createStatement();
-                st.execute(String.format("""
-                            INSERT INTO transacoes (limite, valor, valor_apos_transacao, client_id, descricao, transacao_type)
-                            VALUES (%d, %d, %d, %d, '%s', '%s')
-                        """, limit, value, newValue, clientId, description, type));
-
-                conn.commit();
                 Map<String, Object> result = new HashMap<>();
-                result.put("limite", limit);
-                result.put("saldo", newValue);
-                return result;
+                int limite = rs.getInt("client_limit");
+                int saldo = rs.getInt("client_balance");
 
+                if (limite == -1 && saldo == -1) {
+                    result.put("unprocess", 422);
+                    return result;
+                } else if (limite == 0 && saldo == 0) {
+                    return null;
+                }
+
+                result.put("limite", limite);
+                result.put("saldo", saldo);
+                return result;
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            return null;
         }
         return null;
+    }
+
+    public static String currentDate(int timestamp) {
+        ZonedDateTime zonedDateTime = ZonedDateTime.now();
+        if (timestamp > 0) {
+            Instant instant = Instant.ofEpochSecond(timestamp);
+            zonedDateTime = ZonedDateTime.ofInstant(instant, ZoneId.systemDefault());
+        }
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'");
+        return zonedDateTime.format(formatter);
     }
 }
