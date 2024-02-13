@@ -6,7 +6,8 @@ services:
   api01: &api
     image: rinha-back
     hostname: api01
-
+    environment:
+      - DB_HOST=db
     ports:
       - "8081:8080"
     depends_on:
@@ -14,8 +15,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "220MB"
+          cpus: "0.55"
+          memory: "200MB"
 
   api02:
     <<: *api
@@ -49,7 +50,7 @@ services:
       - "5432:5432"
     volumes:
       - ./script.sql:/docker-entrypoint-initdb.d/script.sql
-    command: -c fsync=off -c full_page_writes=off
+    command: -c fsync=off -c full_page_writes=off -c work_mem=8MB -c synchronous_commit=off
     deploy:
       resources:
         limits:
@@ -57,8 +58,8 @@ services:
           # aqui declarados é de 1.5 unidades de CPU e 550MB
           # de memória. A distribuição feita aqui é apenas
           # um exemplo – distribua como quiser.
-          cpus: "0.2"
-          memory: "100MB"
+          cpus: "0.3"
+          memory: "140MB"
 
 networks:
   default:
