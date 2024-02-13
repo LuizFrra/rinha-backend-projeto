@@ -10,8 +10,6 @@ CREATE TABLE transacoes (
 );
 
 CREATE INDEX idx_transacao_client ON transacoes(client_id, transacao_id DESC);
---CREATE UNIQUE INDEX idx_transacao_id ON transacoes (transacao_id DESC);
---CREATE INDEX idx_client_id ON transacoes (client_id);
 
 INSERT INTO transacoes (limite, valor, valor_apos_transacao, client_id, transacao_type) VALUES
 (100000, 0, 0, 1, 's'),
